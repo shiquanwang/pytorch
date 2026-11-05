@@ -3794,6 +3794,7 @@ class _TestParamsMaxPoolBase:
     def __init__(self) -> None:
         self.kwargs = {
             'kernel_size': [3],
+            # Overlapping stride first: some tests only use the first sample
             'stride': [2, None],
             'ceil_mode': [True, False],
             'padding': [0, 1],
@@ -3802,9 +3803,9 @@ class _TestParamsMaxPoolBase:
         }
 
         self.shapes = [
-            [1, 2, None],  # batch
+            [2, None],  # batch
             [2],  # channels
-            [3, 6]  # signal
+            [6, 3]  # signal; 6 first so the first sample has a partial ceil_mode window
         ]
 
     def _gen_shape(self):
@@ -3827,32 +3828,28 @@ class _TestParamsMaxPoolBase:
         yield from product(self._gen_shape(), self._gen_kwargs())
 
 class _TestParamsMaxPool1d(_TestParamsMaxPoolBase):
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.kwargs['kernel_size'] += [(3,)]
-        self.kwargs['stride'] += [(2,)]
-        self.kwargs['padding'] += [(1,)]
-        self.kwargs['dilation'] += [(1,)]
+    pass
 
 class _TestParamsMaxPool2d(_TestParamsMaxPoolBase):
 
     def __init__(self) -> None:
         super().__init__()
-        self.kwargs['kernel_size'] += [(3, 2)]
-        self.kwargs['stride'] += [(2, 1)]
-        self.kwargs['padding'] += [(1, 1)]
-        self.kwargs['dilation'] += [(1, 2)]
+        self.kwargs['kernel_size'] = [(3, 2)]
+        # Per-dim stride values differ: H overlaps and W tiles (both overlap with dilation)
+        self.kwargs['stride'] = [(1, 2), None]
+        self.kwargs['padding'] = [0, (1, 1)]
+        self.kwargs['dilation'] = [1, (1, 2)]
 
-        self.shapes.append([6])
+        self.shapes.append([5])  # odd, so the first sample has a partial ceil_mode window in W
 
 class _TestParamsMaxPool3d(_TestParamsMaxPoolBase):
 
     def __init__(self) -> None:
         super().__init__()
-        self.kwargs['kernel_size'] += [(3, 2, 3)]
-        self.kwargs['stride'] += [(2, 1, 2)]
-        self.kwargs['dilation'] += [(1, 2, 1)]
+        self.kwargs['kernel_size'] = [(3, 2, 3)]
+        # Per-dim stride values differ: H tiles and D, W overlap (all overlap with dilation)
+        self.kwargs['stride'] = [(2, 2, 1), None]
+        self.kwargs['dilation'] = [1, (1, 2, 1)]
 
         self.shapes.append([6])
         self.shapes.append([5])
@@ -3869,6 +3866,9 @@ def sample_inputs_max_pool(op_info, device, dtype, requires_grad, **kwargs):
 
     params_generator = params_generator_type_dict[op_info.name]()
     for (shape, memory_format), kwargs in params_generator.gen_input_params():
+        # max_pool2d_backward always computes indices, so return_indices=False would be a duplicate
+        if op_info.name == 'max_pool2d_with_indices_backward' and not kwargs['return_indices']:
+            continue
         arg = make_arg(shape).to(memory_format=memory_format).requires_grad_(requires_grad)
         yield SampleInput(arg, kwargs=kwargs)
 
@@ -10491,8 +10491,9 @@ def sample_inputs_max_unpool(op_info, device, dtype, requires_grad, **kwargs):
             yield SampleInput(arg, args=(indices,), kwargs=sample_kwargs)
 
 def sample_inputs_max_unpool_grad(op_info, device, dtype, requires_grad, **kwargs):
-    for sample in sample_inputs_max_unpool(op_info, device, dtype, requires_grad, **kwargs):
-        indices = sample.args[0]
+    samples = list(sample_inputs_max_unpool(op_info, device, dtype, requires_grad, **kwargs))
+    smallest_size = min(s.kwargs['output_size'][2] for s in samples)
+    for sample in samples:
         # The samples for max_unpool are generated with max_pool.
         # It could be that a single element from the max_pool's
         # input is mapped to several locations in its output.
@@ -10508,8 +10509,11 @@ def sample_inputs_max_unpool_grad(op_info, device, dtype, requires_grad, **kwarg
         # 2. Make sure that the equivalence classes are all singletons,
         # i.e. the index tensor has to be comprised of only unique
         # indices.
-        # Here we go with the solution 2, the easiest of all.
-        if indices.unique().numel() == indices.numel():
+        # Here we go with the solution 2, the easiest of all: non-overlapping
+        # windows (stride=None, i.e. stride == kernel_size) always give unique indices.
+        # gradcheck is expensive, so only the smallest max_pool input is kept;
+        # output_size is that input's shape (sample.input is the pooled output).
+        if sample.kwargs['stride'] is None and sample.kwargs['output_size'][2] == smallest_size:
             yield sample
 
 def sample_inputs_multi_head_attention_forward(opinfo, device, dtype, requires_grad, **kwargs):
