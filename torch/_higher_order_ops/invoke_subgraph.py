@@ -47,11 +47,29 @@ from torch.utils.checkpoint import _CachedTorchDispatchMode, _CachingTorchDispat
 invoke_subgraph_counter = 0
 
 
-# Keep this list limited to configs with established region-local semantics.
+# Keep this list limited to configs with established region-local semantics: a
+# key qualifies only if every read of it happens while the region is lowered or
+# codegened under its patch, or is baked into the region's kernels at codegen.
+# Each entry notes where its value is consumed; check new keys the same way.
 _SUPPORTED_NESTED_REGION_INDUCTOR_CONFIG_KEYS = frozenset(
     {
+        # Read by the region's own scheduler. It only switches combo kernels on
+        # or off: the other combo settings (combo_kernels_autotune,
+        # combo_kernel_allow_mixed_sizes, combo_kernel_per_subkernel_blocks,
+        # combo_kernel_peak_memory_*) are not patchable per region and always
+        # come from the enclosing compile.
+        "combo_kernels",
+        # Read per node while the region is lowered (GraphLowering).
         "fallback_by_default",
+        # Read during lowering for GEMM autotuning choices, and baked into the
+        # region's kernels' inductor_meta at codegen.
         "max_autotune",
+        # Baked into the region's kernels' inductor_meta at codegen. The runtime
+        # heuristics autotune pointwise kernels when max_autotune or this key is
+        # set, and triton.autotune_pointwise separately enables multi-config
+        # tuning. So a region can add pointwise autotuning, but False cannot
+        # turn off autotuning that either of those enables.
+        "max_autotune_pointwise",
     }
 )
 
