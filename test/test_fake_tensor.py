@@ -5889,6 +5889,9 @@ class TestCppFakeTensorModeBindings(TestCase):
         self.assertIs(rebuilt.shape_env, shape_env)
         self.assertEqual(rebuilt.epoch, 3)
         self.assertIs(torch._C._maybe_get_fake_mode(fake), rebuilt)
+        with rebuilt:
+            self.assertEqual(self._installed(), (rebuilt, True))
+        self.assertEqual(self._installed(), (None, False))
 
         # A wrapper another lookup cached while _from_cpp_mode ran is returned
         # rather than replaced
@@ -5908,6 +5911,59 @@ class TestCppFakeTensorModeBindings(TestCase):
 
         with patch.object(CppFakeTensorMode, "_from_cpp_mode", classmethod(reentrant)):
             self.assertIs(torch._C._maybe_get_fake_mode(other), inner[0])
+
+    def test_cpp_fake_tensor_mode_enter_exit(self):
+        from torch._subclasses.fake_tensor import CppFakeTensorMode
+        from torch.utils._python_dispatch import is_in_torch_dispatch_mode
+
+        mode = CppFakeTensorMode()
+        only_lift_cpu_tensors = torch._C._only_lift_cpu_tensors()
+        # Without a device, a fake mode only lifts CPU tensors while active
+        with patch.object(CppFakeTensorMode, "avoid_device_init", True):
+            with mode:
+                self.assertEqual(self._installed(), (mode, True))
+                self.assertTrue(torch._C._only_lift_cpu_tensors())
+                self.assertTrue(is_in_torch_dispatch_mode())
+                # Re-entering the active mode is a no-op; entering another one
+                # suspends it until that one exits
+                for inner in (mode, CppFakeTensorMode()):
+                    with inner:
+                        self.assertEqual(self._installed(), (inner, True))
+                    self.assertEqual(self._installed(), (mode, True))
+                    self.assertTrue(torch._C._only_lift_cpu_tensors())
+                    self.assertTrue(is_in_torch_dispatch_mode())
+            self.assertEqual(self._installed(), (None, False))
+            self.assertEqual(torch._C._only_lift_cpu_tensors(), only_lift_cpu_tensors)
+            self.assertFalse(is_in_torch_dispatch_mode())
+
+        # Exiting restores the flag rather than clearing it
+        with BaseTorchDispatchMode():
+            with mode:
+                pass
+            self.assertTrue(is_in_torch_dispatch_mode())
+
+        # An entered mode is kept alive until it exits, so exiting it through
+        # the FAKE slot still finds its enter_stack
+        mode = CppFakeTensorMode()
+        ref = weakref.ref(mode)
+        mode.__enter__()
+        del mode
+        gc.collect()
+        fake_key = torch._C._TorchDispatchModeKey.FAKE
+        torch._C._get_dispatch_mode(fake_key).__exit__(None, None, None)
+        self.assertEqual(self._installed(), (None, False))
+        gc.collect()
+        self.assertIsNone(ref())
+
+        # The placeholder meta indices and values that the sparse impls' copies
+        # allocate do not reach the active mode, which would reject them
+        with torch._functorch.config.patch(fake_tensor_allow_meta=False):
+            strict_mode = CppFakeTensorMode()
+        cpu = torch.device("cpu")
+        for layout in (torch.sparse_coo, torch.sparse_csr):
+            sparse_meta = torch.empty(2, 2, layout=layout, device="meta")
+            with strict_mode:
+                torch._C._from_meta_and_device(sparse_meta, cpu, strict_mode._cpp_mode)
 
 
 if __name__ == "__main__":
