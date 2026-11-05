@@ -2050,6 +2050,10 @@ class cpp:
     # enable weight prepacking to get a better performance; may lead to large memory footprint
     weight_prepack = os.environ.get("TORCHINDUCTOR_CPP_WEIGHT_PREPACK", "1") == "1"
 
+    # Scalar sqrt / rsqrt without the errno update (the build keeps
+    # -fmath-errno), so the compiler can hoist them out of loops
+    sqrt_without_errno = False
+
     # Inject a bug into our relu implementation; useful for testing our repro
     # extraction and minification functionality.
     # Valid values: "compile_error", "runtime_error", "accuracy"

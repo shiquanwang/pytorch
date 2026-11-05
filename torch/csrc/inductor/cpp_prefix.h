@@ -37,6 +37,7 @@
 #include <c10/util/generic_math.h>
 #include <c10/util/irange.h>
 #include <torch/csrc/inductor/aoti_torch/c/shim.h>
+#include <torch/headeronly/cpu/vec/intrinsics.h>
 
 #if defined(CPU_CAPABILITY_AVX512) || defined(CPU_CAPABILITY_AVX2) ||  \
     defined(CPU_CAPABILITY_ZVECTOR) || defined(CPU_CAPABILITY_NEON) || \
@@ -115,6 +116,23 @@ struct GetScalarType<at::vec::VectorizedN<T, N>> {
   using type = T;
 };
 #endif
+
+// std::sqrt for float / double without the errno update -fmath-errno keeps:
+// with errno, sqrt is a call with a side effect, so the compiler can't hoist it
+// out of loops. Use sqrt_without_errno to enable hoisting.
+// Only x86 is supported.
+template <typename T>
+inline auto sqrt_without_errno(T x) {
+#if defined(__x86_64__) || defined(_M_X64)
+  if constexpr (std::is_same_v<T, float>) {
+    return _mm_cvtss_f32(_mm_sqrt_ss(_mm_set_ss(x)));
+  } else if constexpr (std::is_same_v<T, double>) {
+    __m128d v = _mm_set_sd(x);
+    return _mm_cvtsd_f64(_mm_sqrt_sd(v, v));
+  }
+#endif
+  return std::sqrt(x);
+}
 
 inline uint64_t ceil_log2_u64(uint64_t n) {
   if (n <= 1) {
