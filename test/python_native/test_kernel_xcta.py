@@ -3,11 +3,18 @@
 
 import sys
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
 from torch.testing._internal.common_cuda import SM90OrLater, TEST_CUDA
-from torch.testing._internal.common_utils import run_tests, TEST_CUTEDSL, TestCase
+from torch.testing._internal.common_utils import (
+    instantiate_parametrized_tests,
+    parametrize,
+    run_tests,
+    TEST_CUTEDSL,
+    TestCase,
+)
 
 
 if not TEST_CUTEDSL:
@@ -120,6 +127,48 @@ class TestKernelXcta(TestCase):
                 torch.float32,
             )
         )
+
+    @parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+    def test_welford_long_subrows(self, dtype):
+        """Split one Welford row into the 16384-element sub-rows B200 selects."""
+        n = 1 << 22
+        x = torch.randn(1, n, device="cuda", dtype=dtype)
+        key = f"long_subrows_{dtype}"
+        f32 = [torch.float32] * 2
+        trait = T.VarMeanOps(correction=0)
+        res = kernel_xcta.reduce_row_xcta_2out(trait, key, x, f32, subrow_target=16384)
+        self.assertIsNotNone(res, "the split declined a shape it is meant to serve")
+        # Geometry entries lead with the sub-row count C.
+        splits = {geom[0] for k, geom in kernel_xcta._GEOM.items() if k[0] == key}
+        self.assertEqual(splits, {n // 16384})
+        want = torch.var_mean(x.double(), dim=1, correction=0)
+        self.assertEqual(res, tuple(w.float() for w in want), atol=1e-4, rtol=1e-4)
+
+    def test_b200_welford_subrow_target(self):
+        # Only single-row Welford at the 256 MiB and 2 GiB anchors shortens sub-rows.
+        default = kernel_xcta._XctaConfig().subrow_target
+        welford, plain = T.WelfordOps(correction=0), T.SumOps(acc=cutlass.Float32)
+        n = 128 << 20
+        cases = (
+            ((1, n), welford, "var0", 16384),
+            ((2, n), welford, "var0", default),
+            ((1, n - 2048), welford, "var0", default),
+            ((1, n), plain, "sum", default),
+        )
+        caps = SimpleNamespace(cc=(10, 0))
+        for shape, trait, key, want in cases:
+            x = torch.empty(shape, device="cuda", dtype=torch.float16)
+            with (
+                self.subTest(shape=shape, key=key),
+                mock.patch.object(kernel_xcta._hw, "caps", return_value=caps),
+                mock.patch.dict(kernel_xcta._GEOM, clear=True),
+            ):
+                kernel_xcta.reduce_row_xcta(trait, key, x, torch.float32)
+                # Geometry keys carry the sub-row target sixth.
+                self.assertEqual({k[5] for k in kernel_xcta._GEOM}, {want})
+
+
+instantiate_parametrized_tests(TestKernelXcta)
 
 
 if __name__ == "__main__":

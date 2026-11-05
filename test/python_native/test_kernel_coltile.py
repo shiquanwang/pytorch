@@ -209,6 +209,44 @@ class TestKernelColTile(TestCase):
             want = x.double().var(dim=-2).to(dtype)
         torch.testing.assert_close(got, want, **_TOL[dtype])
 
+    @parametrize(
+        "dtype,key,size,threads,unroll,partition,width",
+        [
+            (torch.float16, "sum", 256, 64, 16, True, 8),
+            (torch.bfloat16, "sum", 256, 64, 16, True, 8),
+            (torch.float32, "argmaxi32", 16, 32, 64, False, 0),
+        ],
+        name_fn=lambda dtype, key, *_: f"{key}_{str(dtype)[6:]}",
+    )
+    def test_b200_ragged_column_geometry(
+        self, dtype, key, size, threads, unroll, partition, width
+    ):
+        """Run the B200 4095-column rules, which no explicit launch argument selects."""
+        if torch.cuda.get_device_capability() != (10, 0):
+            self.skipTest("the ragged column rules are measured on B200 only")
+        # Unroll, partial layout and combine width are policy-only, so size the view
+        # onto each rule's anchor: b200_ragged_c4095 and b200_ragged_argmax_c4095_small.
+        rows = (size << 20) // (4095 * dtype.itemsize)
+        x = torch.randn(rows, 4095, device="cuda", dtype=dtype)
+        for k in [k for k in ct._CACHE if k[1] == key]:
+            del ct._CACHE[k]
+        if key == "sum":
+            trait, out = T.SumOps(acc=cutlass.Float32), torch.float32
+        else:
+            trait, out = T.ArgMaxOps(acc=cutlass.Float32), torch.int64
+        got = ct.reduce_col_tile(trait, key, x, out)
+        # Six key fields precede TileReduce.cache_sig, whose vec, threads_per_block,
+        # unroll and pc are its 2nd, 4th, 7th and 11th fields.
+        plans = [k for k in ct._CACHE if k[:2] == ("coltile", key)]
+        stage1 = {(k[7], k[9], k[12], k[16]) for k in plans}
+        self.assertEqual(stage1, {(1, threads, unroll, partition)})
+        # Tiled stage-two keys end with PartialColumns.cache_sig, (tile_columns, nouts).
+        tiled = {k[-2] for k in ct._CACHE if k[:2] == ("coltile2t", key)}
+        self.assertEqual(tiled, {width} if width else set())
+        with torch.backends.python_native.cutedsl.disabled():
+            want = x.sum(0, dtype=out) if key == "sum" else x.argmax(0)
+        self.assertEqual(got, want, **_TOL[torch.float32])
+
     def test_dispatcher_routes_a_column_reduction(self):
         # Numerics cannot distinguish the column arm from K0; assert routing and reshape.
         trait = T.SumOps(acc=cutlass.Float32)
@@ -637,6 +675,12 @@ class TestOrderedColRoute(TestCase):
             (1, (128, 2047), False),
             (1, (128, 128, 31), False),
             (1, (128, 128, 32), True),
+            (1, (1, 32768, 128), True),
+            (1, (1, 32768, 127), False),
+            (1, (1, 24577, 128), True),
+            (1, (1, 24576, 128), False),
+            (1, (2, 32768, 128), False),
+            (2, (1, 32768, 16384), False),
         ],
         name_fn=lambda n, shape, routed: f"{n}f_" + "x".join(map(str, shape)),
     )
@@ -683,6 +727,13 @@ class TestOrderedColRoute(TestCase):
         narrow = ct._OrderedColReduce(trait, plan, 1024, (1 << 21) - 1, 1)
         wide = ct._OrderedColReduce(trait, plan, 1024, 1 << 21, 1)
         self.assertEqual((narrow.wide, wide.wide), (False, True))
+
+    @parametrize("columns", [512, 1024])
+    def test_general_norm_splits_need_wide_columns(self, columns):
+        view = torch.empty((1, 32768, columns), device="meta")
+        self.assertTrue(kg._ordered_col_route_ok(view, T.SumOps()))
+        routed = kg._ordered_col_route_ok(view, T.NormOps(3))
+        self.assertEqual(routed, columns >= 1024)
 
 
 class TestOrderedColHost(TestCase):
@@ -1199,6 +1250,37 @@ class TestOrderedColDevice(TestCase):
         # The last block's output index, B * C + WARP, must stay below the Int32 limit.
         with mock.patch.object(ct, "_INT32_LIMIT", 2 * 64 + 32):
             self.assertIsNone(ct.reduce_ordered_col(trait, "decline_int32", x, f32, 1))
+
+    def test_split_policy_matches_the_indexed_tree(self, device):
+        """Keep B200's split tile widths and input-dtype outputs bitwise exact."""
+        if torch.cuda.get_device_capability(device) != (10, 0):
+            self.skipTest("the split policy is measured on B200 only")
+        x = torch.randn(32768, 257, device=device, dtype=torch.float16)
+        key, trait, outputs = "split_policy", T.SumOps(), [torch.float16]
+        got, _ = self._reduce(device, trait, key, x, 0, outputs, route=True)
+        ops = [_ordered_fields(k) for k in ct._CACHE if k[:2] == ("ordered_col1", key)]
+        rows, columns = x.shape
+        plan = ct.trait_itree_plan(trait, rows, columns, 2, stage=False, device=device)
+        full = ct._full_column_tiles(plan, rows)
+        cfg = ct.select_ordered_col_config(
+            (10, 0),
+            x.dtype,
+            key,
+            columns,
+            1,
+            plan.split[0],
+            field_bits=(32,),
+            out_dtypes=tuple(outputs),
+            rows=rows,
+            full_tiles=full,
+        )
+        self.assertEqual({f["tile_columns"] for f in ops}, {cfg.tile_columns})
+        # Full tiles split off a ragged final partition, which keeps its clamps.
+        ragged = plan.split[1] != plan.split[2]
+        tiles = {True, False} if cfg.full_tiles and ragged else {cfg.full_tiles}
+        self.assertEqual({f["full_tiles"] for f in ops}, tiles)
+        want, _ = self._reduce(device, trait, key, x, 0, outputs, route=False)
+        self._assert_bitwise(got, want)
 
     @parametrize(
         "op,in_dtype,rows,cols,workers,width,start,split,full,used",
