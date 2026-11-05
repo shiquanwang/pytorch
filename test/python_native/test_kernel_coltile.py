@@ -171,6 +171,44 @@ class TestKernelColTile(TestCase):
         )
         self.assertEqual(out, x.var(dim=0), atol=1e-4, rtol=1e-4)
 
+    @parametrize(
+        "dtype,group,npar,shape",
+        [
+            # 100 rows in 16 blocks of q = 7 leave counts 7 (x14), 2 and 0.
+            (torch.float32, 4, 16, (100, 33)),
+            (torch.float32, 8, 16, (100, 33)),
+            (torch.float32, 16, 16, (100, 33)),
+            (torch.float32, 8, 1, (1024, 33)),
+            (torch.float32, 16, 1, (1025, 33)),
+            (torch.float32, 4, 16, (3, 1027, 33)),
+            (torch.bfloat16, 8, 16, (100, 33)),
+            (torch.float16, 16, 1, (3, 1027, 33)),
+        ],
+        name_fn=lambda dtype, group, npar, shape: (
+            f"{str(dtype)[6:]}_g{group}_p{npar}_" + "x".join(map(str, shape))
+        ),
+    )
+    def test_grouped_welford_columns(self, dtype, group, npar, shape):
+        """Equal-count column groups must preserve ragged tails, partials, and batches."""
+        x = torch.randn(shape, device="cuda").to(dtype)
+        trait = T.WelfordOps(correction=1, acc=cutlass.Float32)
+        key = f"grouped_welford_{dtype}_{group}_{npar}_" + "x".join(map(str, shape))
+        cfg = ct.ColConfig("test_grouped", 64, npar, 1, "column", group=group)
+        with mock.patch.object(ct, "select_col_config", return_value=cfg):
+            if x.dim() == 2:
+                got = ct.reduce_col_tile(trait, key, x, dtype)
+            else:
+                (got,) = ct.reduce_batched_col_tile(trait, key, x, [dtype], 1)
+        # Plan keys end with TileReduce.cache_sig; locate col_group by varying only it.
+        op = (trait, cutlass.Float32, "col", 1)
+        sigs = [tile.TileReduce(*op, vec=1, col_group=g).cache_sig for g in (1, 4)]
+        (slot,) = (i - len(sigs[0]) for i, (a, b) in enumerate(zip(*sigs)) if a != b)
+        groups = {k[slot] for k in ct._CACHE if k[:2] == ("coltile", key)}
+        self.assertEqual(groups, {group})
+        with torch.backends.python_native.cutedsl.disabled():
+            want = x.double().var(dim=-2).to(dtype)
+        torch.testing.assert_close(got, want, **_TOL[dtype])
+
     def test_dispatcher_routes_a_column_reduction(self):
         # Numerics cannot distinguish the column arm from K0; assert routing and reshape.
         trait = T.SumOps(acc=cutlass.Float32)
@@ -405,6 +443,24 @@ class TestColTileHost(TestCase):
         self.assertIsNone(col.tm)
         with self.assertRaisesRegex(AssertionError, "no tile"):
             col.tilemap
+
+    @parametrize(
+        "case",
+        [
+            dict(col_group=2),
+            dict(axis="row"),
+            dict(combine=True),
+            dict(vec=4),
+            dict(trait=T.SumOps(acc=cutlass.Float32)),
+        ],
+        name_fn=lambda case: "_".join(case),
+    )
+    def test_column_groups_need_scalar_welford_columns(self, case):
+        welford = T.WelfordOps(acc=cutlass.Float32)
+        kwargs = dict(trait=welford, axis="col", vec=1, col_group=4) | case
+        trait, axis = kwargs.pop("trait"), kwargs.pop("axis")
+        with self.assertRaisesRegex(ValueError, "column groups need scalar Welford"):
+            tile.TileReduce(trait, cutlass.Float32, axis, 1024, **kwargs)
 
     def test_over_reported_split_stays_correct(self):
         # 64 chunks of ceil(65 / 64) = 2 rows leave the last 31 empty; they must load
@@ -672,6 +728,27 @@ class TestOrderedColHost(TestCase):
             self.assertIsNone(select("argmaxi32", **dict(index, field_bits=(32, 64))))
             # min_blocks counts 32-column blocks of useful lanes: 3 * 32 < 4 * 32.
             self.assertIsNone(select(columns=32, partials=3))
+
+    def test_welford_keys_share_policies(self):
+        """Map variance keys without a policy to var0 or varmean0 by output count."""
+        var = ct.OrderedColConfig(0, tile_columns=16)
+        varmean = ct.OrderedColConfig(0, tile_columns=8)
+        std = ct.OrderedColConfig(0)
+        table = {(9, 0): {"var0": var, "varmean0": varmean, "std1": std}}
+        cases = (
+            ("std1", (torch.float32,), std),
+            ("std0", (torch.float32,), var),
+            ("var1", (torch.bfloat16,), var),
+            ("stdmean0", (torch.float32,) * 2, varmean),
+            ("stdmean0", (torch.float32,), None),
+        )
+        bits = (32,) * 3
+        with mock.patch.dict(ct._ORDERED_COL_CONFIGS, table):
+            for key, outs, want in cases:
+                got = ct.select_ordered_col_config(
+                    (9, 0), outs[0], key, 64, 1, 2, field_bits=bits, out_dtypes=outs
+                )
+                self.assertEqual(got, want, msg=key)
 
 
 @unittest.skipUnless(TEST_CUDA and SM90OrLater, "requires Hopper or later")
