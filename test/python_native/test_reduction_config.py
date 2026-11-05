@@ -104,6 +104,129 @@ class TestReductionConfig(TestCase):
             kg._GeneralConfig(block=kg._K0_ALL_BLOCK, rule="general_one_output"),
         )
 
+    @parametrize(
+        "dtype,width,mib,key,fields,nouts,expected",
+        [
+            (torch.float32, 256, 64, "mean", 1, 1, "inner_tree"),
+            (torch.float32, 256, 16, "mean", 1, 1, "linear"),
+            (torch.float32, 256, 64, "argmaxi32", 2, 1, "linear"),
+            (torch.float32, 256, 256, "argmaxi32", 2, 1, "inner_tree"),
+            (torch.bfloat16, 256, 16, "sum", 1, 1, "inner_tree"),
+            (torch.bfloat16, 256, 16, "argmaxi32", 2, 1, "linear"),
+            (torch.bfloat16, 256, 64, "sum", 1, 1, "linear"),
+            (torch.float32, 1024, 64, "var0", 3, 1, "inner_tree"),
+            (torch.float32, 1024, 64, "var0", 3, 2, "linear"),
+            (torch.float32, 1024, 256, "argmaxi32", 2, 1, "linear"),
+            (torch.bfloat16, 1024, 64, "argmaxi32", 2, 1, "inner_tree"),
+            (torch.float32, 4096, 16, "varmean0", 3, 2, "inner_tree"),
+            (torch.bfloat16, 4096, 16, "argmaxi32", 2, 1, "inner_tree"),
+            (torch.float32, 4096, 16, "mean", 1, 1, "inner_tree"),
+            (torch.float32, 4096, 64, "sum", 1, 1, "linear"),
+            (torch.float32, 4096, 256, "sum", 1, 1, "inner_tree"),
+            (torch.bfloat16, 4096, 2048, "mean", 1, 1, "linear"),
+        ],
+    )
+    def test_sm107_row_profiles(self, dtype, width, mib, key, fields, nouts, expected):
+        """Pin each arm of the SM107 row policy."""
+        rows = (mib << 20) // (width * dtype.itemsize)
+        self.assertEqual(
+            rt.select_row_order(
+                (10, 7),
+                dtype,
+                key,
+                width,
+                rows,
+                nfields=fields,
+                nouts=nouts,
+            ),
+            expected,
+        )
+
+    @parametrize(
+        "dtype,mib,key,fields,rule",
+        [
+            (torch.float32, 256, "sum", 1, "rubin_strided_sum"),
+            (torch.bfloat16, 2048, "sum", 1, "rubin_strided_sum"),
+            (torch.bfloat16, 16, "var0", 3, "rubin_strided_welford"),
+            (torch.float32, 256, "var0", 3, "rubin_strided_welford"),
+            (torch.float32, 64, "mean", 1, "rubin_strided_inner"),
+            (torch.float32, 64, "sum", 1, "rubin_strided_inner"),
+            (torch.float32, 16, "sum", 1, "general_default"),
+            (torch.bfloat16, 64, "argmaxi32", 2, "rubin_strided_argmax"),
+            (torch.float32, 2048, "argmaxi32", 2, "rubin_strided_argmax"),
+            (torch.float32, 256, "argmaxi32", 2, "general_default"),
+            (torch.float32, 64, "argmaxi32", 2, "general_default"),
+        ],
+    )
+    def test_sm107_general_profiles(self, dtype, mib, key, fields, rule):
+        """Pin each distinct SM107 strided policy."""
+        rows = (mib << 20) // (1024 * dtype.itemsize)
+        cfg = kg.select_general_config(
+            (10, 7),
+            dtype,
+            key,
+            1024,
+            rows,
+            ((1024, 2),),
+            ((rows, 2048),),
+            nfields=fields,
+            nouts=1,
+        )
+        self.assertEqual(cfg.rule, rule)
+        self.assertEqual(cfg.block, 64 if rule == "rubin_strided_sum" else kg._K0_BLOCK)
+        linear = rule in ("rubin_strided_sum", "general_default")
+        self.assertEqual(cfg.kernel_order, "linear" if linear else "inner_tree")
+
+    @parametrize(
+        "base,updates",
+        [
+            (
+                {},
+                {
+                    "count": 2048,
+                    "num_o": 32768,
+                    "red_pairs": ((2048, 2),),
+                    "kept_pairs": ((32768, 4096),),
+                },
+            ),
+            ({}, {"num_o": 65535, "kept_pairs": ((65535, 2048),)}),
+            ({}, {"red_pairs": ((1024, 4),)}),
+            ({}, {"kept_pairs": ((65536, 4096),)}),
+            ({}, {"acc_bits": 64}),
+            ({}, {"alignment": 8}),
+            (
+                {
+                    "dtype": torch.bfloat16,
+                    "num_o": 131072,
+                    "kept_pairs": ((131072, 2048),),
+                },
+                {"dtype": torch.float16},
+            ),
+        ],
+    )
+    def test_sm107_general_guards(self, base, updates):
+        """Keep a 256 MiB strided anchor that breaks one guard on the generic policy."""
+        selected = dict(base, cc=(10, 7))
+        self.assertEqual(self.general(**selected).rule, "rubin_strided_sum")
+        self.assertEqual(self.general(**dict(selected, **updates)), kg._GeneralConfig())
+
+    @parametrize("alignment,expected", [(16, "inner_tree"), (8, "linear")])
+    def test_sm107_row_alignment_guard(self, alignment, expected):
+        """Keep underaligned SM107 row anchors on the linear order."""
+        self.assertEqual(
+            rt.select_row_order(
+                (10, 7),
+                torch.float32,
+                "var0",
+                1024,
+                M=65536,
+                nfields=3,
+                nouts=1,
+                alignment=alignment,
+            ),
+            expected,
+        )
+
     def test_fallback_warns_once_per_reason(self):
         """Report each distinct reason a gated inner-tree request fell back."""
         with (
