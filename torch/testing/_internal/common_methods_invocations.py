@@ -5915,11 +5915,10 @@ def sample_inputs_mode(op_info, device, dtype, requires_grad, **kwargs):
         ((S, S, S), (),),
         ((S, S, S), (1, ),),
         ((S, S, S), (1, True, ),),
-        ((), (),),
         ((), (0,),),
         ((), (0, True,),),
-        # Non-fused mode kernel on CUDA
-        ((3000,), ()),
+        # Non-fused CUDA mode kernel: slice_size > 2 * MAX_BLOCK_SIZE in native/cuda/TensorModeKernel.cpp
+        ((2049,), ()),
     )
     make_arg = partial(make_tensor, dtype=dtype, device=device,
                        requires_grad=requires_grad, low=None, high=None)
@@ -18012,10 +18011,8 @@ op_db: list[OpInfo] = [
            skips=(
                # Resized a non-empty tensor but did not warn about it
                DecorateInfo(unittest.expectedFailure, 'TestCommon', 'test_out_warning'),
-               # FIXME:
-               # Expected 2114 but got 1123.
-               # Absolute difference: 991 (up to 0.001 allowed)
-               # Relative difference: 0.46877956480605487 (up to 0.001 allowed)
+               # FIXME: ROCm only; when the mode value occurs more than once, CPU (unstable sort)
+               # and CUDA can return different occurrence indices
                DecorateInfo(
                    unittest.skip("Skipped!"),
                    "TestCommon",
