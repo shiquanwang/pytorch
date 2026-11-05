@@ -37,6 +37,7 @@ from torch.testing._internal.common_modules import module_db, modules
 from torch.testing._internal.common_utils import (
     HardwareClassification,
     is_iterable_of_tensors,
+    periodic,
     run_tests,
     skipIfCrossRef,
     skipIfTorchDynamo,
@@ -701,6 +702,7 @@ class TestDecomp(TestCase):
 
     @suppress_warnings
     @tf32_off()
+    @periodic
     # only tests RNNs since we have py dispsatcher decomps for them
     @modules(
         filter(
