@@ -493,6 +493,7 @@ PYTHON_NATIVE_CUTEDSL_SUITES=(
   python_native/test_traits
   python_native/test_instrumentation
   python_native/test_tile_datapath
+  python_native/test_reductions_cutedsl
 )
 
 test_python_smoke() {
