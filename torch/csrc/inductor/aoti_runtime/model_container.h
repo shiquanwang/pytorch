@@ -792,6 +792,11 @@ class AOTInductorModelContainer {
             /* device_index = */ 0,
             &tensor_handle));
       } else {
+#if TORCH_FEATURE_VERSION >= TORCH_VERSION_2_16_0 && defined(USE_MTIA)
+        AOTI_RUNTIME_CHECK(
+            false,
+            "MTIA AOTInductor supports only user-managed constant updates");
+#endif
         auto* constants_blob_ptr =
             static_cast<uint8_t*>(target.ensure_blob(blob_size_));
 
